@@ -18,7 +18,13 @@ The function implemented in this file should be used by trainer with different d
 implement PPO-like algorithms.
 """
 
-__all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
+__all__ = [
+    "register_adv_est",
+    "get_adv_estimator_fn",
+    "AdvantageEstimator",
+    "is_self_distillation_loss_mode",
+    "is_self_distillation_reweight_loss_mode",
+]
 
 from collections import defaultdict
 from enum import Enum
@@ -48,6 +54,23 @@ PolicyLossFn = Callable[
 ]
 
 POLICY_LOSS_REGISTRY: dict[str, PolicyLossFn] = {}
+
+SDPO_LOSS_MODE = "sdpo"
+SRPO_LOSS_MODE = "srpo"
+SELF_DISTILLATION_REWEIGHT_LOSS_MODES = {"rlsd"}
+SELF_DISTILLATION_LOSS_MODES = {SDPO_LOSS_MODE, SRPO_LOSS_MODE, *SELF_DISTILLATION_REWEIGHT_LOSS_MODES}
+
+
+def normalize_self_distillation_loss_mode(loss_mode: str) -> str:
+    return loss_mode.replace("-", "_")
+
+
+def is_self_distillation_reweight_loss_mode(loss_mode: str) -> bool:
+    return loss_mode in SELF_DISTILLATION_REWEIGHT_LOSS_MODES
+
+
+def is_self_distillation_loss_mode(loss_mode: str) -> bool:
+    return loss_mode in SELF_DISTILLATION_LOSS_MODES
 
 
 def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:
@@ -1082,6 +1105,161 @@ def agg_loss(
     return loss
 
 
+def _config_get(config: Any, key: str, default: Any = None) -> Any:
+    if config is None:
+        return default
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _get_token_reweight_lambda(self_distillation_config: Any, global_step: Optional[int] = None) -> float:
+    init_lambda = float(
+        _config_get(
+            self_distillation_config,
+            "token_reweight_lambda",
+            _config_get(self_distillation_config, "rlsd_lambda", 0.5),
+        )
+    )
+    decay_steps = _config_get(self_distillation_config, "token_reweight_decay_steps", None)
+    if decay_steps is None or decay_steps <= 0 or global_step is None:
+        return init_lambda
+
+    completed_steps = max(float(global_step) - 1.0, 0.0)
+    decay = max(0.0, 1.0 - completed_steps / float(decay_steps))
+    return init_lambda * decay
+
+
+def compute_self_distillation_reweighted_advantages(
+    loss_mode: str,
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    self_distillation_config: Any,
+    self_distillation_mask: Optional[torch.Tensor] = None,
+    self_distillation_correct_mask: Optional[torch.Tensor] = None,
+    global_step: Optional[int] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Apply RLSD token reweighting to GRPO advantages.
+
+    Uses the same SDPO teacher context supplied by the trainer. Tokens without
+    that context keep their original GRPO advantage.
+    """
+    normalized_mode = normalize_self_distillation_loss_mode(loss_mode)
+    if normalized_mode != "rlsd":
+        raise ValueError(f"Unsupported self-distillation token reweight mode: {loss_mode}")
+
+    log_ratio = teacher_log_probs - student_log_probs
+    sign_advantage = torch.sign(advantages).detach()
+    log_weight = torch.clamp(sign_advantage * log_ratio.detach(), min=-20.0, max=20.0)
+    raw_weight = torch.exp(log_weight)
+
+    eps_w = float(
+        _config_get(
+            self_distillation_config,
+            "token_reweight_eps_w",
+            _config_get(self_distillation_config, "rlsd_eps_w", 0.2),
+        )
+    )
+    weight_lower = max(0.0, 1.0 - eps_w)
+    weight_upper = 1.0 + eps_w
+    clipped_weight = torch.clamp(raw_weight, min=weight_lower, max=weight_upper)
+
+    lambda_t = _get_token_reweight_lambda(self_distillation_config, global_step=global_step)
+    modulator = (1.0 - lambda_t) + lambda_t * clipped_weight
+
+    active_mask = response_mask.to(dtype=modulator.dtype)
+    if self_distillation_mask is not None:
+        active_mask = active_mask * self_distillation_mask.to(dtype=modulator.dtype).unsqueeze(-1)
+
+    modulator = active_mask * modulator + (1.0 - active_mask)
+    refined_advantages = advantages * modulator
+
+    valid = response_mask.bool()
+    active = active_mask.bool() & valid
+    metrics: dict[str, Any] = {
+        "self_distillation/token_reweight_lambda": lambda_t,
+        "self_distillation/token_reweight_eps_w": eps_w,
+        "self_distillation/token_reweight_active_token_fraction": (
+            active.float().sum() / valid.float().sum().clamp(min=1.0)
+        )
+        .detach()
+        .item(),
+    }
+    if self_distillation_mask is not None:
+        metrics["self_distillation/token_reweight_context_sample_fraction"] = (
+            self_distillation_mask.float().mean().detach().item()
+        )
+    if self_distillation_correct_mask is not None:
+        metrics["self_distillation/token_reweight_correct_sample_fraction"] = (
+            self_distillation_correct_mask.float().mean().detach().item()
+        )
+    if active.any():
+        active_weight = raw_weight[active]
+        active_clipped_weight = clipped_weight[active]
+        metrics.update(
+            {
+                "self_distillation/token_reweight_w_mean": active_weight.mean().detach().item(),
+                "self_distillation/token_reweight_w_std": active_weight.std(unbiased=False).detach().item(),
+                "self_distillation/token_reweight_w_clipped_mean": active_clipped_weight.mean().detach().item(),
+                "self_distillation/token_reweight_w_clip_frac": (
+                    ((active_weight < weight_lower) | (active_weight > weight_upper)).float().mean().detach().item()
+                ),
+            }
+        )
+    else:
+        metrics.update(
+            {
+                "self_distillation/token_reweight_w_mean": 1.0,
+                "self_distillation/token_reweight_w_std": 0.0,
+                "self_distillation/token_reweight_w_clipped_mean": 1.0,
+                "self_distillation/token_reweight_w_clip_frac": 0.0,
+            }
+        )
+
+    return refined_advantages, metrics
+
+
+def compute_self_distillation_reweighted_policy_loss(
+    loss_mode: str,
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    self_distillation_config: Any,
+    self_distillation_mask: Optional[torch.Tensor] = None,
+    self_distillation_correct_mask: Optional[torch.Tensor] = None,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: Optional[torch.Tensor] = None,
+    global_step: Optional[int] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    refined_advantages, reweight_metrics = compute_self_distillation_reweighted_advantages(
+        loss_mode=loss_mode,
+        student_log_probs=log_prob,
+        teacher_log_probs=teacher_log_probs,
+        advantages=advantages,
+        response_mask=response_mask,
+        self_distillation_config=self_distillation_config,
+        self_distillation_mask=self_distillation_mask,
+        self_distillation_correct_mask=self_distillation_correct_mask,
+        global_step=global_step,
+    )
+    pg_loss, pg_metrics = compute_policy_loss_vanilla(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=refined_advantages,
+        response_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_is_weights=rollout_is_weights,
+    )
+    pg_metrics.update(reweight_metrics)
+    return pg_loss, pg_metrics
+
+
 def compute_self_distillation_loss(
     student_log_probs: torch.Tensor,
     teacher_log_probs: torch.Tensor,
@@ -1179,6 +1357,38 @@ def compute_self_distillation_loss(
     if rollout_is_weights is not None:
         per_token_loss = per_token_loss * rollout_is_weights
 
+    if _config_get(self_distillation_config, "srpo_dynamic_weighting", False):
+        if not self_distillation_config.full_logit_distillation:
+            raise ValueError("SRPO dynamic weighting requires full_logit_distillation=True.")
+        teacher_probs = teacher_distill_log_probs.exp()
+        teacher_entropy = -(teacher_probs * teacher_distill_log_probs).sum(dim=-1)
+        temperature = float(_config_get(self_distillation_config, "srpo_dynamic_weighting_temperature", 1.0))
+        token_weights = torch.exp((-teacher_entropy / temperature).clamp(min=-20.0, max=20.0))
+        active_mask = loss_mask.to(dtype=token_weights.dtype)
+        normalizer = (token_weights * active_mask).sum().clamp(min=1e-6) / active_mask.sum().clamp(min=1.0)
+        token_weights = token_weights / normalizer.detach()
+        per_token_loss = per_token_loss * token_weights
+        metrics.update(
+            {
+                "self_distillation/dynamic_weighting_enabled": 1.0,
+                "self_distillation/dynamic_weight_entropy_mean": (
+                    (teacher_entropy * active_mask).sum() / active_mask.sum().clamp(min=1.0)
+                )
+                .detach()
+                .item(),
+                "self_distillation/dynamic_weight_mean": (
+                    (token_weights * active_mask).sum() / active_mask.sum().clamp(min=1.0)
+                )
+                .detach()
+                .item(),
+                "self_distillation/dynamic_weight_max": token_weights[active_mask.bool()].max().detach().item()
+                if active_mask.bool().any().item()
+                else 0.0,
+            }
+        )
+    else:
+        metrics["self_distillation/dynamic_weighting_enabled"] = 0.0
+
     loss = agg_loss(
         loss_mat=per_token_loss,
         loss_mask=loss_mask,
@@ -1186,6 +1396,73 @@ def compute_self_distillation_loss(
         batch_num_tokens=loss_mask.sum().clamp(min=1.0),
     )
     return loss, metrics
+
+
+def compute_srpo_policy_loss(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    self_distillation_config: Any,
+    self_distillation_mask: torch.Tensor,
+    self_distillation_correct_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: Optional[torch.Tensor] = None,
+    old_log_probs: Optional[torch.Tensor] = None,
+    student_all_log_probs: Optional[torch.Tensor] = None,
+    teacher_all_log_probs: Optional[torch.Tensor] = None,
+    student_topk_log_probs: Optional[torch.Tensor] = None,
+    teacher_topk_log_probs: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Sample-Routed Policy Optimization.
+
+    Correct samples use the GRPO/PPO branch. Incorrect samples with teacher context use
+    the SDPO branch, optionally with entropy-aware dynamic token weighting.
+    """
+    if config is None:
+        raise ValueError("SRPO requires actor config for the GRPO branch.")
+
+    correct_sample_mask = self_distillation_correct_mask.to(dtype=response_mask.dtype)
+    distill_sample_mask = self_distillation_mask.to(dtype=response_mask.dtype) * (1.0 - correct_sample_mask)
+    grpo_token_mask = response_mask * (1.0 - distill_sample_mask.unsqueeze(1))
+
+    grpo_loss, grpo_metrics = compute_policy_loss_vanilla(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=grpo_token_mask,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_is_weights=rollout_is_weights,
+    )
+    sdpo_loss, sdpo_metrics = compute_self_distillation_loss(
+        student_log_probs=log_prob,
+        teacher_log_probs=teacher_log_probs,
+        response_mask=response_mask,
+        self_distillation_config=self_distillation_config,
+        old_log_probs=old_log_probs if old_log_probs is not None else old_log_prob,
+        student_all_log_probs=student_all_log_probs,
+        teacher_all_log_probs=teacher_all_log_probs,
+        student_topk_log_probs=student_topk_log_probs,
+        teacher_topk_log_probs=teacher_topk_log_probs,
+        self_distillation_mask=distill_sample_mask,
+        loss_agg_mode=loss_agg_mode,
+        rollout_is_weights=rollout_is_weights,
+    )
+
+    total_loss = grpo_loss + sdpo_loss
+    metrics = {
+        "srpo/grpo_loss": grpo_loss.detach().item(),
+        "srpo/sdpo_loss": sdpo_loss.detach().item(),
+        "srpo/correct_sample_fraction": correct_sample_mask.float().mean().detach().item(),
+        "srpo/sdpo_sample_fraction": distill_sample_mask.float().mean().detach().item(),
+        "srpo/grpo_sample_fraction": (1.0 - distill_sample_mask).float().mean().detach().item(),
+    }
+    metrics.update({f"srpo/grpo_{key}": value for key, value in grpo_metrics.items()})
+    metrics.update(sdpo_metrics)
+    return total_loss, metrics
 
 
 @deprecated("verl.trainer.ppo.core_algos.compute_policy_loss_vanilla")

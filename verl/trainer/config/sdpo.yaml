@@ -4,19 +4,17 @@ defaults:
   - _self_
 
 # MAX_PROMPT_LENGTH=2048
-# MAX_RESPONSE_LENGTH=8192
-# MAX_FEEDBACK_LENGTH=8192
-# TEMPLATE_LENGTH=512  # heuristic upper bound, not enforced
-# MAX_MODEL_LEN=$((TEMPLATE_LENGTH + MAX_PROMPT_LENGTH + MAX_FEEDBACK_LENGTH + MAX_RESPONSE_LENGTH))
-max_model_len: 18944
+# MAX_RESPONSE_LENGTH=20480
+# MAX_MODEL_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
+max_model_len: 22528
 
 actor_rollout_ref:
   actor:
-    ppo_mini_batch_size: 32 # TODO: make slightly off-policy in the future; use same as baseline; perhaps make 1 again for fastest convergence
+    ppo_mini_batch_size: 128
     policy_loss:
       loss_mode: sdpo
     self_distillation:
-      max_reprompt_len: 10240
+      max_reprompt_len: 22528
       is_clip: 2.0
     optim:
       lr: 1e-5
@@ -32,7 +30,7 @@ algorithm:
     rollout_is_threshold: 2.0
 
 data:
-  train_batch_size: 32
+  train_batch_size: 256
 
 trainer:
   val_before_train: False

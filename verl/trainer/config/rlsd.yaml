@@ -3,24 +3,33 @@ defaults:
   - user
   - _self_
 
-# MAX_PROMPT_LENGTH=2048
-# MAX_RESPONSE_LENGTH=20480
-# MAX_MODEL_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 max_model_len: 22528
 
 actor_rollout_ref:
   actor:
     ppo_mini_batch_size: 128
+    policy_loss:
+      loss_mode: rlsd
+    self_distillation:
+      max_reprompt_len: 22528
+      token_reweight_lambda: 0.5
+      token_reweight_eps_w: 0.2
+      token_reweight_decay_steps: 50
+    optim:
+      lr: 1e-6
   rollout:
     n: 8
     calculate_log_probs: True
 
 algorithm:
   adv_estimator: grpo
-  norm_adv_by_std_in_grpo: False
+  norm_adv_by_std_in_grpo: True
   rollout_correction:
     rollout_is: token
     rollout_is_threshold: 2.0
 
 data:
   train_batch_size: 256
+
+trainer:
+  val_before_train: False

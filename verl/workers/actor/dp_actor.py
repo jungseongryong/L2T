@@ -29,7 +29,16 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    compute_self_distillation_loss,
+    compute_self_distillation_reweighted_policy_loss,
+    compute_srpo_policy_loss,
+    get_policy_loss_fn,
+    is_self_distillation_loss_mode,
+    is_self_distillation_reweight_loss_mode,
+    kl_penalty,
+)
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -132,7 +141,7 @@ class DataParallelPPOActor(BasePPOActor):
     def _update_teacher(self) -> None:
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-        if not self_distillation_cfg or loss_mode != "sdpo":
+        if not self_distillation_cfg or not is_self_distillation_loss_mode(loss_mode):
             return
         teacher_regularization = getattr(self_distillation_cfg, "teacher_regularization", "ema")
         if teacher_regularization != "ema":
@@ -679,9 +688,13 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         pad_token_id = data.meta_info.get("pad_token_id", 0)
+        global_step = data.meta_info.get("global_steps", None)
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
-        self_distillation_enabled = loss_mode == "sdpo"
+        sdpo_loss_enabled = loss_mode == "sdpo"
+        srpo_loss_enabled = loss_mode == "srpo"
+        self_distillation_reweight_enabled = is_self_distillation_reweight_loss_mode(loss_mode)
+        self_distillation_enabled = sdpo_loss_enabled or srpo_loss_enabled or self_distillation_reweight_enabled
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         if self_distillation_enabled:
             self_distillation_required_keys = {
@@ -690,6 +703,8 @@ class DataParallelPPOActor(BasePPOActor):
                 "teacher_position_ids",
                 "self_distillation_mask",
             }
+            if loss_mode == "srpo":
+                self_distillation_required_keys.add("self_distillation_correct_mask")
             assert self_distillation_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {self_distillation_required_keys - set(data.batch.keys())}"
 
         select_keys = [
@@ -707,6 +722,8 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("ref_log_prob")
         if self_distillation_enabled:
             select_keys.extend(list(self_distillation_required_keys))
+            if "self_distillation_correct_mask" in data.batch.keys() and "self_distillation_correct_mask" not in select_keys:
+                select_keys.append("self_distillation_correct_mask")
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -763,6 +780,9 @@ class DataParallelPPOActor(BasePPOActor):
 
                     calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
                     self_distillation_mask = model_inputs.get("self_distillation_mask") if self_distillation_enabled else None
+                    self_distillation_correct_mask = (
+                        model_inputs.get("self_distillation_correct_mask") if self_distillation_enabled else None
+                    )
                     if self_distillation_enabled:
                         assert not has_multi_modal_inputs, "Multi-modal inputs are not supported for distillation"
 
@@ -775,8 +795,16 @@ class DataParallelPPOActor(BasePPOActor):
                     if teacher_regularization == "trust-region" and self.use_fused_kernels:
                         raise ValueError("trust-region teacher requires disabling fused kernels to access logits.")
                     # all return: (bsz, response_length)
-                    return_all_logps = self_distillation_cfg.full_logit_distillation and not self_distillation_cfg.distillation_topk
-                    distill_topk = self_distillation_cfg.distillation_topk if self_distillation_cfg.full_logit_distillation else None
+                    return_all_logps = (
+                        (sdpo_loss_enabled or srpo_loss_enabled)
+                        and self_distillation_cfg.full_logit_distillation
+                        and not self_distillation_cfg.distillation_topk
+                    )
+                    distill_topk = (
+                        self_distillation_cfg.distillation_topk
+                        if (sdpo_loss_enabled or srpo_loss_enabled) and self_distillation_cfg.full_logit_distillation
+                        else None
+                    )
                     outputs = self._forward_micro_batch(
                         model_inputs,
                         temperature=temperature,
@@ -830,20 +858,56 @@ class DataParallelPPOActor(BasePPOActor):
                         teacher_log_prob = teacher_outputs["log_probs"]
                         teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
                         teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
-                        pg_loss, pg_metrics = compute_self_distillation_loss(
-                            student_log_probs=log_prob,
-                            teacher_log_probs=teacher_log_prob,
-                            response_mask=response_mask,
-                            self_distillation_config=self_distillation_cfg,
-                            old_log_probs=old_log_prob,
-                            student_all_log_probs=student_all_logps,
-                            teacher_all_log_probs=teacher_all_logps,
-                            student_topk_log_probs=student_topk_logps,
-                            teacher_topk_log_probs=teacher_topk_logps,
-                            self_distillation_mask=self_distillation_mask,
-                            loss_agg_mode=loss_agg_mode,
-                            rollout_is_weights=rollout_is_weights,
-                        )
+                        if srpo_loss_enabled:
+                            pg_loss, pg_metrics = compute_srpo_policy_loss(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                teacher_log_probs=teacher_log_prob,
+                                self_distillation_config=self_distillation_cfg,
+                                self_distillation_mask=self_distillation_mask,
+                                self_distillation_correct_mask=self_distillation_correct_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                config=self.config,
+                                rollout_is_weights=rollout_is_weights,
+                                old_log_probs=old_log_prob,
+                                student_all_log_probs=student_all_logps,
+                                teacher_all_log_probs=teacher_all_logps,
+                                student_topk_log_probs=student_topk_logps,
+                                teacher_topk_log_probs=teacher_topk_logps,
+                            )
+                        elif sdpo_loss_enabled:
+                            pg_loss, pg_metrics = compute_self_distillation_loss(
+                                student_log_probs=log_prob,
+                                teacher_log_probs=teacher_log_prob,
+                                response_mask=response_mask,
+                                self_distillation_config=self_distillation_cfg,
+                                old_log_probs=old_log_prob,
+                                student_all_log_probs=student_all_logps,
+                                teacher_all_log_probs=teacher_all_logps,
+                                student_topk_log_probs=student_topk_logps,
+                                teacher_topk_log_probs=teacher_topk_logps,
+                                self_distillation_mask=self_distillation_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                rollout_is_weights=rollout_is_weights,
+                            )
+                        else:
+                            pg_loss, pg_metrics = compute_self_distillation_reweighted_policy_loss(
+                                loss_mode=loss_mode,
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                teacher_log_probs=teacher_log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                self_distillation_config=self_distillation_cfg,
+                                self_distillation_mask=self_distillation_mask,
+                                self_distillation_correct_mask=self_distillation_correct_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                config=self.config,
+                                rollout_is_weights=rollout_is_weights,
+                                global_step=global_step,
+                            )
 
                         pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
                         micro_batch_metrics.update(pg_metrics)
