@@ -1260,7 +1260,7 @@ def compute_self_distillation_reweighted_policy_loss(
     return pg_loss, pg_metrics
 
 
-def compute_self_distillation_loss(
+def _compute_self_distillation_loss_mat(
     student_log_probs: torch.Tensor,
     teacher_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
@@ -1271,9 +1271,8 @@ def compute_self_distillation_loss(
     student_topk_log_probs: Optional[torch.Tensor] = None,
     teacher_topk_log_probs: Optional[torch.Tensor] = None,
     self_distillation_mask: Optional[torch.Tensor] = None,
-    loss_agg_mode: str = "token-mean",
     rollout_is_weights: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, dict[str, Any]]:
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
 
     metrics = {}
 
@@ -1389,6 +1388,37 @@ def compute_self_distillation_loss(
     else:
         metrics["self_distillation/dynamic_weighting_enabled"] = 0.0
 
+    return per_token_loss, loss_mask, metrics
+
+
+def compute_self_distillation_loss(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    self_distillation_config: Any,
+    old_log_probs: Optional[torch.Tensor] = None,
+    student_all_log_probs: Optional[torch.Tensor] = None,
+    teacher_all_log_probs: Optional[torch.Tensor] = None,
+    student_topk_log_probs: Optional[torch.Tensor] = None,
+    teacher_topk_log_probs: Optional[torch.Tensor] = None,
+    self_distillation_mask: Optional[torch.Tensor] = None,
+    loss_agg_mode: str = "token-mean",
+    rollout_is_weights: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    per_token_loss, loss_mask, metrics = _compute_self_distillation_loss_mat(
+        student_log_probs=student_log_probs,
+        teacher_log_probs=teacher_log_probs,
+        response_mask=response_mask,
+        self_distillation_config=self_distillation_config,
+        old_log_probs=old_log_probs,
+        student_all_log_probs=student_all_log_probs,
+        teacher_all_log_probs=teacher_all_log_probs,
+        student_topk_log_probs=student_topk_log_probs,
+        teacher_topk_log_probs=teacher_topk_log_probs,
+        self_distillation_mask=self_distillation_mask,
+        rollout_is_weights=rollout_is_weights,
+    )
+
     loss = agg_loss(
         loss_mat=per_token_loss,
         loss_mask=loss_mask,
@@ -1396,6 +1426,52 @@ def compute_self_distillation_loss(
         batch_num_tokens=loss_mask.sum().clamp(min=1.0),
     )
     return loss, metrics
+
+
+def _compute_vanilla_policy_loss_mat(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    config: ActorConfig,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    clip_ratio = config.clip_ratio
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+    clip_ratio_c = config.get("clip_ratio_c", 3.0)
+
+    assert clip_ratio_c > 1.0, (
+        "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
+        + f" but get the value: {clip_ratio_c}."
+    )
+
+    negative_approx_kl = log_prob - old_log_prob
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    pg_clipfrac_lower = verl_F.masked_mean(
+        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
+    )
+
+    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+    }
+    return pg_losses, metrics
 
 
 def compute_srpo_policy_loss(
@@ -1428,16 +1504,15 @@ def compute_srpo_policy_loss(
     distill_sample_mask = self_distillation_mask.to(dtype=response_mask.dtype) * (1.0 - correct_sample_mask)
     grpo_token_mask = response_mask * (1.0 - distill_sample_mask.unsqueeze(1))
 
-    grpo_loss, grpo_metrics = compute_policy_loss_vanilla(
+    grpo_loss_mat, grpo_metrics = _compute_vanilla_policy_loss_mat(
         old_log_prob=old_log_prob,
         log_prob=log_prob,
         advantages=advantages,
         response_mask=grpo_token_mask,
-        loss_agg_mode=loss_agg_mode,
         config=config,
         rollout_is_weights=rollout_is_weights,
     )
-    sdpo_loss, sdpo_metrics = compute_self_distillation_loss(
+    sdpo_loss_mat, sdpo_token_mask, sdpo_metrics = _compute_self_distillation_loss_mat(
         student_log_probs=log_prob,
         teacher_log_probs=teacher_log_probs,
         response_mask=response_mask,
@@ -1448,14 +1523,23 @@ def compute_srpo_policy_loss(
         student_topk_log_probs=student_topk_log_probs,
         teacher_topk_log_probs=teacher_topk_log_probs,
         self_distillation_mask=distill_sample_mask,
-        loss_agg_mode=loss_agg_mode,
         rollout_is_weights=rollout_is_weights,
     )
 
-    total_loss = grpo_loss + sdpo_loss
+    routed_loss_mat = grpo_loss_mat * grpo_token_mask + sdpo_loss_mat * sdpo_token_mask
+    routed_token_mask = grpo_token_mask + sdpo_token_mask
+    total_routed_tokens = routed_token_mask.sum().clamp(min=1.0)
+    total_loss = routed_loss_mat.sum() / total_routed_tokens
+
+    grpo_tokens = grpo_token_mask.sum().clamp(min=1.0)
+    sdpo_tokens = sdpo_token_mask.sum().clamp(min=1.0)
+    grpo_loss = (grpo_loss_mat * grpo_token_mask).sum() / grpo_tokens
+    sdpo_loss = (sdpo_loss_mat * sdpo_token_mask).sum() / sdpo_tokens
     metrics = {
         "srpo/grpo_loss": grpo_loss.detach().item(),
         "srpo/sdpo_loss": sdpo_loss.detach().item(),
+        "srpo/routed_loss": total_loss.detach().item(),
+        "srpo/routed_token_count": routed_token_mask.sum().detach().item(),
         "srpo/correct_sample_fraction": correct_sample_mask.float().mean().detach().item(),
         "srpo/sdpo_sample_fraction": distill_sample_mask.float().mean().detach().item(),
         "srpo/grpo_sample_fraction": (1.0 - distill_sample_mask).float().mean().detach().item(),
