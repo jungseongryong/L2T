@@ -32,6 +32,24 @@ from verl.utils.device import auto_set_device, is_cuda_available
 from verl.utils.import_utils import load_extern_object
 
 
+def self_distillation_needs_teacher_ref(config) -> bool:
+    self_distillation_cfg = config.actor_rollout_ref.actor.get("self_distillation", None)
+    if self_distillation_cfg is None:
+        return False
+
+    from verl.trainer.ppo.core_algos import is_self_distillation_loss_mode
+
+    loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+    if not is_self_distillation_loss_mode(loss_mode):
+        return False
+
+    teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
+    if teacher_regularization == "trust-region":
+        return True
+
+    return teacher_regularization == "ema" and self_distillation_cfg.get("teacher_update_rate", 0.0) != 0.0
+
+
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
     """Main entry point for PPO training with Hydra configuration management.
@@ -126,14 +144,12 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer import Role
 
         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-        self_distillation_cfg = config.actor_rollout_ref.actor.get("self_distillation", None)
-        loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        self_distillation_needs_ref = self_distillation_cfg is not None and loss_mode == "sdpo"
+        self_distillation_needs_ref = self_distillation_needs_teacher_ref(config)
         if self_distillation_needs_ref and need_reference_policy(config):
-            raise ValueError("SDPO cannot share the reference policy with KL regularization.")
+            raise ValueError("Self-distillation cannot share the reference policy with KL regularization.")
         if self_distillation_needs_ref and use_legacy_worker_impl == "disable":
             raise ValueError(
-                "SDPO requires the legacy worker implementation to colocate the teacher."
+                "Self-distillation teacher regularization requires the legacy worker implementation to colocate the teacher."
             )
 
         # use new model engine implementation
