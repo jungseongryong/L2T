@@ -31,6 +31,7 @@ import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import (
     agg_loss,
+    compute_evolving_teacher_policy_loss,
     compute_self_distillation_loss,
     compute_self_distillation_reweighted_policy_loss,
     compute_srpo_policy_loss,
@@ -696,6 +697,28 @@ class DataParallelPPOActor(BasePPOActor):
         self_distillation_reweight_enabled = is_self_distillation_reweight_loss_mode(loss_mode)
         self_distillation_enabled = sdpo_loss_enabled or srpo_loss_enabled or self_distillation_reweight_enabled
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
+        evolving_teacher_cfg = (
+            self_distillation_cfg.get("evolving_teacher", None) if self_distillation_cfg is not None else None
+        )
+        evolving_teacher_enabled = bool(
+            evolving_teacher_cfg is not None and evolving_teacher_cfg.get("enable", False)
+        )
+        evolving_teacher_loss_weight = 0.0
+        if evolving_teacher_enabled:
+            if not self_distillation_enabled:
+                raise ValueError("ET v0 requires policy_loss.loss_mode to be one of sdpo, srpo, or rlsd.")
+            evolving_teacher_loss_weight = float(evolving_teacher_cfg.get("loss_weight", 0.0))
+            if evolving_teacher_loss_weight <= 0.0:
+                raise ValueError("ET v0 requires self_distillation.evolving_teacher.loss_weight > 0.")
+            teacher_regularization_for_et = self_distillation_cfg.get("teacher_regularization", "ema")
+            if teacher_regularization_for_et == "ema":
+                if self_distillation_cfg.get("teacher_update_rate", 0.0) != 0.0:
+                    raise ValueError("ET v0 does not support EMA teacher_update_rate > 0.")
+            elif teacher_regularization_for_et == "trust-region":
+                if self.teacher_module is None or self.teacher_module is self.actor_module:
+                    raise ValueError("ET with trust-region requires a separate trust-region teacher_module.")
+            else:
+                raise ValueError(f"Unsupported teacher_regularization for ET: {teacher_regularization_for_et}")
         if self_distillation_enabled:
             self_distillation_required_keys = {
                 "teacher_input_ids",
@@ -832,6 +855,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # Extract pre-computed rollout correction weights if present
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+                    et_loss = None
 
                     if self_distillation_enabled:
                         teacher_inputs = {
@@ -911,6 +935,26 @@ class DataParallelPPOActor(BasePPOActor):
 
                         pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
                         micro_batch_metrics.update(pg_metrics)
+                        if evolving_teacher_enabled:
+                            et_outputs = self._forward_micro_batch(
+                                teacher_inputs,
+                                temperature=temperature,
+                                calculate_entropy=False,
+                                return_all_logps=False,
+                                distill_topk=None,
+                                module=self.actor_module,
+                            )
+                            et_loss, et_metrics = compute_evolving_teacher_policy_loss(
+                                teacher_log_probs=et_outputs["log_probs"],
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                evolving_teacher_config=evolving_teacher_cfg,
+                                self_distillation_mask=self_distillation_mask,
+                                self_distillation_correct_mask=self_distillation_correct_mask,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                            et_metrics["et/loss_weight"] = evolving_teacher_loss_weight
+                            micro_batch_metrics.update(et_metrics)
                     else:
                         # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                         # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
@@ -943,6 +987,8 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics.update(rollout_corr_metrics)
 
                     policy_loss = pg_loss
+                    if et_loss is not None:
+                        policy_loss = policy_loss + evolving_teacher_loss_weight * et_loss
                     if calculate_entropy and entropy is not None:
                         entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()

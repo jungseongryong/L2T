@@ -1,11 +1,14 @@
 import torch
+import pytest
 
 from verl.trainer.ppo.core_algos import (
+    compute_evolving_teacher_policy_loss,
     compute_srpo_policy_loss,
     compute_self_distillation_reweighted_advantages,
     is_self_distillation_loss_mode,
     is_self_distillation_reweight_loss_mode,
 )
+from verl.workers.config.actor import EvolvingTeacherConfig, SelfDistillationConfig
 
 
 class AttrDict(dict):
@@ -113,3 +116,81 @@ def test_srpo_uses_single_token_denominator_across_routed_branches():
     assert torch.allclose(loss, torch.tensor(-1.0))
     assert metrics["srpo/grpo_loss"] == -3.0
     assert metrics["srpo/sdpo_loss"] == 3.0
+
+
+def test_evolving_teacher_policy_loss_uses_ratio_one_teacher_view_pg():
+    teacher_log_probs = torch.zeros(1, 2, requires_grad=True)
+    advantages = torch.tensor([[2.0, -3.0]])
+    response_mask = torch.ones_like(advantages)
+    cfg = AttrDict(enable=True, loss_weight=0.1, mask="all")
+
+    loss, metrics = compute_evolving_teacher_policy_loss(
+        teacher_log_probs=teacher_log_probs,
+        advantages=advantages,
+        response_mask=response_mask,
+        evolving_teacher_config=cfg,
+    )
+    loss.backward()
+
+    assert torch.allclose(loss, torch.tensor(0.0))
+    assert teacher_log_probs.grad[0, 0] < 0
+    assert teacher_log_probs.grad[0, 1] > 0
+    assert metrics["et/active_token_fraction"] == 1.0
+    assert metrics["et/active_sample_fraction"] == 1.0
+
+
+def test_evolving_teacher_policy_loss_can_mask_incorrect_context_samples():
+    teacher_log_probs = torch.zeros(3, 1, requires_grad=True)
+    advantages = torch.ones(3, 1)
+    response_mask = torch.ones_like(advantages)
+    context_mask = torch.tensor([1.0, 1.0, 0.0])
+    correct_mask = torch.tensor([1.0, 0.0, 0.0])
+    cfg = AttrDict(enable=True, loss_weight=0.1, mask="incorrect_context")
+
+    loss, metrics = compute_evolving_teacher_policy_loss(
+        teacher_log_probs=teacher_log_probs,
+        advantages=advantages,
+        response_mask=response_mask,
+        evolving_teacher_config=cfg,
+        self_distillation_mask=context_mask,
+        self_distillation_correct_mask=correct_mask,
+    )
+    loss.backward()
+
+    assert torch.allclose(loss, torch.tensor(0.0))
+    assert teacher_log_probs.grad[0, 0] == 0.0
+    assert teacher_log_probs.grad[1, 0] < 0.0
+    assert teacher_log_probs.grad[2, 0] == 0.0
+    assert metrics["et/active_token_fraction"] == pytest.approx(1.0 / 3.0)
+    assert metrics["et/active_sample_fraction"] == pytest.approx(1.0 / 3.0)
+
+
+def test_evolving_teacher_config_requires_no_ema_update():
+    with pytest.raises(ValueError, match="EMA teacher updates"):
+        SelfDistillationConfig(
+            teacher_regularization="ema",
+            teacher_update_rate=0.1,
+            evolving_teacher=EvolvingTeacherConfig(enable=True, loss_weight=0.1),
+        )
+
+
+def test_self_distillation_config_accepts_evolving_teacher_dict():
+    cfg = SelfDistillationConfig(
+        teacher_update_rate=0.0,
+        evolving_teacher={"enable": True, "loss_weight": 0.1, "mask": "all"},
+    )
+
+    assert isinstance(cfg.evolving_teacher, EvolvingTeacherConfig)
+    assert cfg.evolving_teacher.enable is True
+
+
+def test_evolving_teacher_config_accepts_trust_region_teacher():
+    cfg = SelfDistillationConfig(
+        teacher_regularization="trust-region",
+        teacher_update_rate=0.1,
+        evolving_teacher=EvolvingTeacherConfig(enable=True, loss_weight=0.1),
+    )
+
+    assert cfg.teacher_regularization == "trust-region"
+    assert cfg.teacher_update_rate == 0.1
+    assert cfg.evolving_teacher.enable is True

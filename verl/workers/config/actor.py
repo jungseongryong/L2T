@@ -26,6 +26,7 @@ from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
 __all__ = [
+    "EvolvingTeacherConfig",
     "SelfDistillationConfig",
     "PolicyLossConfig",
     "RouterReplayConfig",
@@ -33,6 +34,38 @@ __all__ = [
     "FSDPActorConfig",
     "McoreActorConfig",
 ]
+
+
+@dataclass
+class EvolvingTeacherConfig(BaseConfig):
+    """Configuration for the ET v0 teacher-view policy-gradient auxiliary loss.
+
+    ET v0 is an actor-only auxiliary loss: no EMA/ref teacher module is
+    trained by ET. The actor is additionally updated on teacher-view
+    log-probabilities with GRPO advantages and an implicit importance ratio of
+    1. When self-distillation uses a trust-region teacher, that separate
+    teacher is used only for the distillation target.
+    """
+
+    enable: bool = False
+    loss_weight: float = 0.0
+    mask: str = "all"
+
+    def __post_init__(self):
+        valid_masks = ["all", "context", "correct", "incorrect", "incorrect_context"]
+        if self.mask not in valid_masks:
+            raise ValueError(
+                f"self_distillation.evolving_teacher.mask must be one of {valid_masks}, got {self.mask}"
+            )
+        if self.loss_weight < 0:
+            raise ValueError(
+                "self_distillation.evolving_teacher.loss_weight must be non-negative, "
+                f"got {self.loss_weight}"
+            )
+        if self.enable and self.loss_weight <= 0:
+            raise ValueError(
+                "self_distillation.evolving_teacher.loss_weight must be positive when ET is enabled"
+            )
 
 
 @dataclass
@@ -58,6 +91,7 @@ class SelfDistillationConfig(BaseConfig):
         token_reweight_decay_steps (Optional[int]): If set, linearly decay token_reweight_lambda to zero.
         srpo_dynamic_weighting (bool): Whether to apply teacher-entropy dynamic weighting to SRPO/SDPO tokens.
         srpo_dynamic_weighting_temperature (float): Softmax temperature for entropy-based token weights.
+        evolving_teacher (EvolvingTeacherConfig): ET v0 teacher-view auxiliary loss config.
         reprompt_template (str): Template for reprompting. Uses {prompt}, {solution}, {feedback} placeholders.
         solution_template (str): Template for formatting solution section. Uses {successful_previous_attempt} placeholder.
         feedback_template (str): Template for formatting feedback section. Uses {feedback_raw} placeholder.
@@ -84,6 +118,7 @@ class SelfDistillationConfig(BaseConfig):
     token_reweight_decay_steps: Optional[int] = None
     srpo_dynamic_weighting: bool = False
     srpo_dynamic_weighting_temperature: float = 1.0
+    evolving_teacher: EvolvingTeacherConfig = field(default_factory=EvolvingTeacherConfig)
     reprompt_template: str = (
         "{prompt}{solution}{feedback}\n\n"
         "Correctly solve the original question.\n"
@@ -102,6 +137,15 @@ class SelfDistillationConfig(BaseConfig):
     environment_feedback_only_without_solution: bool = False
 
     def __post_init__(self):
+        if self.evolving_teacher is None:
+            object.__setattr__(self, "evolving_teacher", EvolvingTeacherConfig())
+        elif not isinstance(self.evolving_teacher, EvolvingTeacherConfig):
+            object.__setattr__(
+                self,
+                "evolving_teacher",
+                EvolvingTeacherConfig(**dict(self.evolving_teacher)),
+            )
+
         if not 0.0 <= self.alpha <= 1.0:
             raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
         valid_teacher_regularization = ["ema", "trust-region"]
@@ -139,6 +183,14 @@ class SelfDistillationConfig(BaseConfig):
                 "self_distillation.srpo_dynamic_weighting_temperature must be positive, "
                 f"got {self.srpo_dynamic_weighting_temperature}"
             )
+        if self.evolving_teacher.enable:
+            if self.teacher_regularization == "ema" and self.teacher_update_rate != 0.0:
+                raise ValueError(
+                    "ET v0 does not support EMA teacher updates. Use "
+                    "self_distillation.teacher_update_rate=0.0, or set "
+                    "self_distillation.teacher_regularization=trust-region where "
+                    "teacher_update_rate is the trust-region mix coefficient."
+                )
 
 
 @dataclass

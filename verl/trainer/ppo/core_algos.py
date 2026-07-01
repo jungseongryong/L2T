@@ -1474,6 +1474,94 @@ def _compute_vanilla_policy_loss_mat(
     return pg_losses, metrics
 
 
+def _build_evolving_teacher_mask(
+    response_mask: torch.Tensor,
+    mask_mode: str,
+    self_distillation_mask: Optional[torch.Tensor] = None,
+    self_distillation_correct_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if mask_mode == "all":
+        return response_mask
+
+    if mask_mode in {"context", "incorrect_context"} and self_distillation_mask is None:
+        raise ValueError(f"ET mask mode '{mask_mode}' requires self_distillation_mask.")
+    if mask_mode in {"correct", "incorrect", "incorrect_context"} and self_distillation_correct_mask is None:
+        raise ValueError(f"ET mask mode '{mask_mode}' requires self_distillation_correct_mask.")
+
+    sample_mask = torch.ones(
+        response_mask.shape[0],
+        dtype=response_mask.dtype,
+        device=response_mask.device,
+    )
+    if mask_mode == "context":
+        sample_mask = self_distillation_mask.to(dtype=response_mask.dtype, device=response_mask.device)
+    elif mask_mode == "correct":
+        sample_mask = self_distillation_correct_mask.to(dtype=response_mask.dtype, device=response_mask.device)
+    elif mask_mode == "incorrect":
+        sample_mask = 1.0 - self_distillation_correct_mask.to(dtype=response_mask.dtype, device=response_mask.device)
+    elif mask_mode == "incorrect_context":
+        context_mask = self_distillation_mask.to(dtype=response_mask.dtype, device=response_mask.device)
+        correct_mask = self_distillation_correct_mask.to(dtype=response_mask.dtype, device=response_mask.device)
+        sample_mask = context_mask * (1.0 - correct_mask)
+    else:
+        raise ValueError(f"Unsupported ET mask mode: {mask_mode}")
+
+    return response_mask * sample_mask.unsqueeze(1)
+
+
+def compute_evolving_teacher_policy_loss(
+    teacher_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    evolving_teacher_config: Any,
+    self_distillation_mask: Optional[torch.Tensor] = None,
+    self_distillation_correct_mask: Optional[torch.Tensor] = None,
+    loss_agg_mode: str = "token-mean",
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """ET v0 teacher-view policy-gradient loss.
+
+    The trajectories are sampled from the student view, so ET v0 uses an implicit
+    importance ratio of 1 and applies GRPO advantages directly to teacher-view
+    log-probabilities.
+    """
+
+    mask_mode = _config_get(evolving_teacher_config, "mask", "all")
+    et_mask = _build_evolving_teacher_mask(
+        response_mask=response_mask,
+        mask_mode=mask_mode,
+        self_distillation_mask=self_distillation_mask,
+        self_distillation_correct_mask=self_distillation_correct_mask,
+    )
+    detached_advantages = advantages.detach()
+    loss_mat = -detached_advantages * teacher_log_probs
+    loss = agg_loss(
+        loss_mat=loss_mat,
+        loss_mask=et_mask,
+        loss_agg_mode=loss_agg_mode,
+        batch_num_tokens=et_mask.sum().clamp(min=1.0),
+    )
+
+    valid_tokens = response_mask.sum().clamp(min=1.0)
+    active_tokens = et_mask.sum()
+    sample_active = (et_mask.sum(dim=-1) > 0).float()
+    sample_valid = (response_mask.sum(dim=-1) > 0).float()
+    active_bool = et_mask.bool()
+    metrics: dict[str, Any] = {
+        "et/loss": loss.detach().item(),
+        "et/active_token_fraction": (active_tokens / valid_tokens).detach().item(),
+        "et/active_sample_fraction": (
+            sample_active.sum() / sample_valid.sum().clamp(min=1.0)
+        ).detach().item(),
+    }
+    if active_bool.any().item():
+        metrics["et/advantage_mean"] = detached_advantages[active_bool].mean().detach().item()
+        metrics["et/log_prob_mean"] = teacher_log_probs.detach()[active_bool].mean().item()
+    else:
+        metrics["et/advantage_mean"] = 0.0
+        metrics["et/log_prob_mean"] = 0.0
+    return loss, metrics
+
+
 def compute_srpo_policy_loss(
     old_log_prob: torch.Tensor,
     log_prob: torch.Tensor,

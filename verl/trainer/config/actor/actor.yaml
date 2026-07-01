@@ -98,10 +98,10 @@ self_distillation:
   # Minimum sequence reward to be considered successful
   success_reward_threshold: 0.5
 
-  # Teacher regularization method: "ema" or "trust-region"
+  # Distillation-target regularization method: "ema" or "trust-region"
   teacher_regularization: ema
 
-  # EMA update rate for teacher weights, or trust-region mixing coefficient
+  # EMA update rate for teacher weights, or trust-region actor/ref mixing coefficient
   teacher_update_rate: 0.0
 
   # Maximum length of the reprompted prompt
@@ -135,6 +135,27 @@ self_distillation:
 
   # Number of steps to linearly decay token_reweight_lambda to zero; null disables decay
   token_reweight_decay_steps: null
+
+  # Whether to apply teacher-entropy dynamic weighting to SRPO/SDPO tokens
+  srpo_dynamic_weighting: False
+
+  # Softmax temperature for SRPO entropy-based dynamic token weights
+  srpo_dynamic_weighting_temperature: 1.0
+
+  # ET v0: actor-only teacher-view policy-gradient auxiliary loss with ratio fixed to 1
+  evolving_teacher:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.workers.config.EvolvingTeacherConfig
+
+    # Whether to enable the ET auxiliary loss
+    enable: False
+
+    # Weight applied to the ET auxiliary loss
+    loss_weight: 0.0
+
+    # all / context / correct / incorrect / incorrect_context
+    mask: all
 
   # Reprompting template - available variables: prompt, successful_previous_attempt, feedback
   reprompt_template: |-

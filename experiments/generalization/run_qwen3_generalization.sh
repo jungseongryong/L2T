@@ -11,7 +11,7 @@
 #   chemistry physics biology material tooluse
 #
 # Methods:
-#   grpo rlsd sdpo srpo
+#   grpo rlsd sdpo sdpo_et sdpo_tr sdpo_tr_et srpo
 
 set -euo pipefail
 
@@ -32,7 +32,7 @@ if [[ "${3:-}" == "--dry-run" ]]; then
 fi
 
 if [[ -z "$DATASET" || -z "$METHOD" ]]; then
-    echo "Usage: $0 <chemistry|physics|biology|material|tooluse> <grpo|rlsd|sdpo|srpo> [--dry-run]" >&2
+    echo "Usage: $0 <chemistry|physics|biology|material|tooluse> <grpo|rlsd|sdpo|sdpo_et|sdpo_tr|sdpo_tr_et|srpo> [--dry-run]" >&2
     exit 1
 fi
 
@@ -103,15 +103,18 @@ VAL_TOP_P="${VAL_TOP_P:-0.95}"
 TOKEN_REWEIGHT_LAMBDA="${TOKEN_REWEIGHT_LAMBDA:-0.5}"
 TOKEN_REWEIGHT_DECAY_STEPS="${TOKEN_REWEIGHT_DECAY_STEPS:-0}"
 TEACHER_UPDATE_RATE="${TEACHER_UPDATE_RATE:-0.05}"
+TRUST_REGION_MIX_COEF="${TRUST_REGION_MIX_COEF:-0.1}"
 RLSD_TOKEN_REWEIGHT_EPS_W="${RLSD_TOKEN_REWEIGHT_EPS_W:-0.2}"
 SRPO_DYNAMIC_WEIGHTING="${SRPO_DYNAMIC_WEIGHTING:-true}"
 SRPO_DYNAMIC_WEIGHTING_TEMPERATURE="${SRPO_DYNAMIC_WEIGHTING_TEMPERATURE:-1.0}"
+ET_LOSS_WEIGHT="${ET_LOSS_WEIGHT:-0.1}"
+ET_MASK="${ET_MASK:-context}"
 
 METHOD_CANONICAL="$METHOD"
 CONFIG_NAME=""
 GROUP_NAME=""
-MINI_BATCH_SIZE=""
-LR=""
+MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-}"
+LR="${LR:-}"
 DECAY_SUFFIX=""
 METHOD_ARGS=()
 
@@ -164,6 +167,77 @@ case "$METHOD" in
             "actor_rollout_ref.actor.self_distillation.is_clip=2.0"
             "actor_rollout_ref.actor.self_distillation.include_environment_feedback=False"
             "actor_rollout_ref.actor.self_distillation.max_reprompt_len=$MAX_MODEL_LEN"
+        )
+        ;;
+    sdpo_tr|sdpo-tr|sdpo+tr)
+        METHOD_CANONICAL="sdpo_tr"
+        CONFIG_NAME="sdpo"
+        GROUP_NAME="QWEN3-SDPO-TR-GRPO-matched-generalization"
+        TRAIN_BATCH_SIZE="${SDPO_TR_TRAIN_BATCH_SIZE:-${SDPO_TRAIN_BATCH_SIZE:-256}}"
+        TRAIN_MAX_SAMPLES="${SDPO_TR_TRAIN_MAX_SAMPLES:-$((TOTAL_TRAINING_STEPS * TRAIN_BATCH_SIZE))}"
+        export WANDB_PROJECT="${SDPO_TR_WANDB_PROJECT:-${SDPO_WANDB_PROJECT:-qwen3-generalization-batch256}}"
+        MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-32}"
+        LR="${LR:-5e-6}"
+        DECAY_SUFFIX="-tr${TRUST_REGION_MIX_COEF}"
+        METHOD_ARGS=(
+            "actor_rollout_ref.model.use_fused_kernels=False"
+            "actor_rollout_ref.actor.policy_loss.loss_mode=sdpo"
+            "actor_rollout_ref.actor.self_distillation.distillation_topk=100"
+            "actor_rollout_ref.actor.self_distillation.alpha=0.5"
+            "actor_rollout_ref.actor.self_distillation.teacher_regularization=trust-region"
+            "actor_rollout_ref.actor.self_distillation.teacher_update_rate=$TRUST_REGION_MIX_COEF"
+            "actor_rollout_ref.actor.self_distillation.is_clip=2.0"
+            "actor_rollout_ref.actor.self_distillation.include_environment_feedback=False"
+            "actor_rollout_ref.actor.self_distillation.max_reprompt_len=$MAX_MODEL_LEN"
+        )
+        ;;
+    sdpo_et|sdpo-et|sdpo+et)
+        METHOD_CANONICAL="sdpo_et"
+        CONFIG_NAME="sdpo"
+        GROUP_NAME="QWEN3-SDPO-ET-GRPO-matched-generalization"
+        TRAIN_BATCH_SIZE="${SDPO_ET_TRAIN_BATCH_SIZE:-${SDPO_TRAIN_BATCH_SIZE:-256}}"
+        TRAIN_MAX_SAMPLES="${SDPO_ET_TRAIN_MAX_SAMPLES:-$((TOTAL_TRAINING_STEPS * TRAIN_BATCH_SIZE))}"
+        export WANDB_PROJECT="${SDPO_ET_WANDB_PROJECT:-${SDPO_WANDB_PROJECT:-qwen3-generalization-batch256}}"
+        MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-32}"
+        LR="${LR:-1e-5}"
+        TEACHER_UPDATE_RATE="0.0"
+        DECAY_SUFFIX="-noema-et${ET_LOSS_WEIGHT}-mask${ET_MASK}"
+        METHOD_ARGS=(
+            "actor_rollout_ref.actor.policy_loss.loss_mode=sdpo"
+            "actor_rollout_ref.actor.self_distillation.distillation_topk=100"
+            "actor_rollout_ref.actor.self_distillation.alpha=0.5"
+            "actor_rollout_ref.actor.self_distillation.teacher_update_rate=$TEACHER_UPDATE_RATE"
+            "actor_rollout_ref.actor.self_distillation.is_clip=2.0"
+            "actor_rollout_ref.actor.self_distillation.include_environment_feedback=False"
+            "actor_rollout_ref.actor.self_distillation.max_reprompt_len=$MAX_MODEL_LEN"
+            "actor_rollout_ref.actor.self_distillation.evolving_teacher.enable=True"
+            "actor_rollout_ref.actor.self_distillation.evolving_teacher.loss_weight=$ET_LOSS_WEIGHT"
+            "actor_rollout_ref.actor.self_distillation.evolving_teacher.mask=$ET_MASK"
+        )
+        ;;
+    sdpo_tr_et|sdpo-tr-et|sdpo+tr+et|sdpo+et+tr)
+        METHOD_CANONICAL="sdpo_tr_et"
+        CONFIG_NAME="sdpo"
+        GROUP_NAME="QWEN3-SDPO-TR-ET-GRPO-matched-generalization"
+        TRAIN_BATCH_SIZE="${SDPO_TR_ET_TRAIN_BATCH_SIZE:-${SDPO_TR_TRAIN_BATCH_SIZE:-${SDPO_TRAIN_BATCH_SIZE:-256}}}"
+        TRAIN_MAX_SAMPLES="${SDPO_TR_ET_TRAIN_MAX_SAMPLES:-$((TOTAL_TRAINING_STEPS * TRAIN_BATCH_SIZE))}"
+        export WANDB_PROJECT="${SDPO_TR_ET_WANDB_PROJECT:-${SDPO_TR_WANDB_PROJECT:-${SDPO_WANDB_PROJECT:-qwen3-generalization-batch256}}}"
+        MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-32}"
+        LR="${LR:-5e-6}"
+        DECAY_SUFFIX="-tr${TRUST_REGION_MIX_COEF}-et${ET_LOSS_WEIGHT}-mask${ET_MASK}"
+        METHOD_ARGS=(
+            "actor_rollout_ref.model.use_fused_kernels=False"
+            "actor_rollout_ref.actor.policy_loss.loss_mode=sdpo"
+            "actor_rollout_ref.actor.self_distillation.distillation_topk=100"
+            "actor_rollout_ref.actor.self_distillation.alpha=0.5"
+            "actor_rollout_ref.actor.self_distillation.teacher_regularization=trust-region"
+            "actor_rollout_ref.actor.self_distillation.teacher_update_rate=$TRUST_REGION_MIX_COEF"
+            "actor_rollout_ref.actor.self_distillation.is_clip=2.0"
+            "actor_rollout_ref.actor.self_distillation.include_environment_feedback=False"
+            "actor_rollout_ref.actor.self_distillation.max_reprompt_len=$MAX_MODEL_LEN"
+            "actor_rollout_ref.actor.self_distillation.evolving_teacher.enable=True"
+            "actor_rollout_ref.actor.self_distillation.evolving_teacher.loss_weight=$ET_LOSS_WEIGHT"
+            "actor_rollout_ref.actor.self_distillation.evolving_teacher.mask=$ET_MASK"
         )
         ;;
     srpo)
