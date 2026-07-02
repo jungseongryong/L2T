@@ -3,7 +3,7 @@
 # Queue Qwen3-8B generalization runs.
 #
 # Usage:
-#   bash scripts/queue_qwen3_8b_generalization_after_pid.sh <pid-to-wait-for> [grpo rlsd sdpo srpo]
+#   bash scripts/queue_qwen3_8b_generalization_after_pid.sh <pid-to-wait-for> [grpo rlsd rlrt rlrt_tr sdpo sdpo_tr srpo srpo_tr]
 
 set -euo pipefail
 

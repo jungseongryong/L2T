@@ -37,7 +37,9 @@ export VAL_TOP_P="${VAL_TOP_P:-0.95}"
 export TRUST_REGION_MIX_COEF="${TRUST_REGION_MIX_COEF:-0.1}"
 export LR="${LR:-5e-6}"
 export ET_LOSS_WEIGHT="${ET_LOSS_WEIGHT:-0.1}"
+export ET_OBJECTIVE="${ET_OBJECTIVE:-policy_gradient}"
 export ET_MASK="${ET_MASK:-context}"
+export ET_ADVANTAGE_FILTER="${ET_ADVANTAGE_FILTER:-all}"
 
 export WANDB_ENTITY="${WANDB_ENTITY:-seongryongjung-chung-ang-university}"
 export WANDB_PROJECT="${WANDB_PROJECT:-qwen3-generalization-batch64}"
@@ -71,7 +73,7 @@ echo "$QUEUE_LOG" > logs/l2t-chemistry-sdpo-tr-et-after.logpath
     echo "[$(date -u +"%F %T UTC")] Finished chemistry SDPO+TR baseline."
 
     echo "[$(date -u +"%F %T UTC")] Starting chemistry SDPO+TR+ET."
-    echo "[$(date -u +"%F %T UTC")] SDPO+TR+ET: trust_region_mix_coef=${TRUST_REGION_MIX_COEF}, et_loss_weight=${ET_LOSS_WEIGHT}, et_mask=${ET_MASK}."
+    echo "[$(date -u +"%F %T UTC")] SDPO+TR+ET: trust_region_mix_coef=${TRUST_REGION_MIX_COEF}, et_loss_weight=${ET_LOSS_WEIGHT}, et_objective=${ET_OBJECTIVE}, et_mask=${ET_MASK}, et_advantage_filter=${ET_ADVANTAGE_FILTER}."
     bash experiments/generalization/run_qwen3_generalization.sh chemistry sdpo_tr_et
     echo "[$(date -u +"%F %T UTC")] Finished chemistry SDPO+TR+ET."
 

@@ -154,8 +154,14 @@ self_distillation:
     # Weight applied to the ET auxiliary loss
     loss_weight: 0.0
 
+    # policy_gradient / view_contrast / reverse_policy_gradient / reverse_view_contrast
+    objective: policy_gradient
+
     # all / context / correct / incorrect / incorrect_context
     mask: all
+
+    # all / positive / negative
+    advantage_filter: all
 
   # Reprompting template - available variables: prompt, successful_previous_attempt, feedback
   reprompt_template: |-

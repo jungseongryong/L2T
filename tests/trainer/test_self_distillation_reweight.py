@@ -20,7 +20,9 @@ def test_self_distillation_reweight_loss_mode_aliases():
     assert is_self_distillation_loss_mode("sdpo")
     assert is_self_distillation_loss_mode("srpo")
     assert is_self_distillation_loss_mode("rlsd")
+    assert is_self_distillation_loss_mode("rlrt")
     assert is_self_distillation_reweight_loss_mode("rlsd")
+    assert is_self_distillation_reweight_loss_mode("rlrt")
     assert not is_self_distillation_reweight_loss_mode("sdpo")
     assert not is_self_distillation_reweight_loss_mode("srpo")
 
@@ -76,6 +78,38 @@ def test_token_reweight_lambda_linear_decay():
     expected = (1.0 - expected_lambda) + expected_lambda * torch.exp(torch.tensor(1.0)).item()
     assert torch.allclose(refined, torch.tensor([[expected]]))
     assert metrics["self_distillation/token_reweight_lambda"] == expected_lambda
+
+
+def test_rlrt_reverses_teacher_signal_and_gates_to_correct_rollouts():
+    student_log_probs = torch.tensor([[-1.0, -3.0], [-1.0, -3.0]])
+    teacher_log_probs = torch.tensor([[-2.0, -2.0], [-2.0, -2.0]])
+    advantages = torch.tensor([[2.0, 2.0], [2.0, 2.0]])
+    response_mask = torch.ones_like(advantages)
+    context_mask = torch.tensor([1.0, 1.0])
+    correct_mask = torch.tensor([1.0, 0.0])
+    cfg = {"token_reweight_lambda": 1.0, "token_reweight_eps_w": 10.0}
+
+    refined, metrics = compute_self_distillation_reweighted_advantages(
+        loss_mode="rlrt",
+        student_log_probs=student_log_probs,
+        teacher_log_probs=teacher_log_probs,
+        advantages=advantages,
+        response_mask=response_mask,
+        self_distillation_config=cfg,
+        self_distillation_mask=context_mask,
+        self_distillation_correct_mask=correct_mask,
+    )
+
+    # RLRT uses exp(sign(A) * (log P_S - log P_T)) and applies it only to correct samples.
+    expected = torch.tensor(
+        [
+            [2.0 * torch.exp(torch.tensor(1.0)).item(), 2.0 * torch.exp(torch.tensor(-1.0)).item()],
+            [2.0, 2.0],
+        ]
+    )
+    assert torch.allclose(refined, expected)
+    assert metrics["self_distillation/token_reweight_is_rlrt"] == 1.0
+    assert metrics["self_distillation/token_reweight_reward_gate_fraction"] == 0.5
 
 
 def test_srpo_uses_single_token_denominator_across_routed_branches():
@@ -163,6 +197,96 @@ def test_evolving_teacher_policy_loss_can_mask_incorrect_context_samples():
     assert teacher_log_probs.grad[2, 0] == 0.0
     assert metrics["et/active_token_fraction"] == pytest.approx(1.0 / 3.0)
     assert metrics["et/active_sample_fraction"] == pytest.approx(1.0 / 3.0)
+
+
+def test_evolving_teacher_policy_loss_can_filter_negative_advantages():
+    teacher_log_probs = torch.zeros(1, 3, requires_grad=True)
+    advantages = torch.tensor([[2.0, -3.0, 0.0]])
+    response_mask = torch.ones_like(advantages)
+    cfg = AttrDict(enable=True, loss_weight=0.1, mask="all", advantage_filter="negative")
+
+    loss, metrics = compute_evolving_teacher_policy_loss(
+        teacher_log_probs=teacher_log_probs,
+        advantages=advantages,
+        response_mask=response_mask,
+        evolving_teacher_config=cfg,
+    )
+    loss.backward()
+
+    assert torch.allclose(loss, torch.tensor(0.0))
+    assert teacher_log_probs.grad[0, 0] == 0.0
+    assert teacher_log_probs.grad[0, 1] > 0.0
+    assert teacher_log_probs.grad[0, 2] == 0.0
+    assert metrics["et/active_token_fraction"] == pytest.approx(1.0 / 3.0)
+    assert metrics["et/advantage_filter_negative"] == 1.0
+
+
+def test_evolving_teacher_policy_loss_can_contrast_teacher_and_student_views():
+    teacher_log_probs = torch.zeros(1, 2, requires_grad=True)
+    student_log_probs = torch.tensor([[4.0, -4.0]], requires_grad=True)
+    advantages = torch.tensor([[2.0, -3.0]])
+    response_mask = torch.ones_like(advantages)
+    cfg = AttrDict(enable=True, loss_weight=0.1, objective="view_contrast", mask="all")
+
+    loss, metrics = compute_evolving_teacher_policy_loss(
+        teacher_log_probs=teacher_log_probs,
+        student_log_probs=student_log_probs,
+        advantages=advantages,
+        response_mask=response_mask,
+        evolving_teacher_config=cfg,
+    )
+    loss.backward()
+
+    assert torch.allclose(loss, torch.tensor(10.0))
+    assert teacher_log_probs.grad[0, 0] < 0.0
+    assert teacher_log_probs.grad[0, 1] > 0.0
+    assert student_log_probs.grad is None
+    assert metrics["et/objective_view_contrast"] == 1.0
+    assert metrics["et/view_delta_mean"] == pytest.approx(0.0)
+
+
+def test_evolving_teacher_policy_loss_can_reverse_teacher_view_pg():
+    teacher_log_probs = torch.zeros(1, 2, requires_grad=True)
+    advantages = torch.tensor([[2.0, -3.0]])
+    response_mask = torch.ones_like(advantages)
+    cfg = AttrDict(enable=True, loss_weight=0.1, objective="reverse_policy_gradient", mask="all")
+
+    loss, metrics = compute_evolving_teacher_policy_loss(
+        teacher_log_probs=teacher_log_probs,
+        advantages=advantages,
+        response_mask=response_mask,
+        evolving_teacher_config=cfg,
+    )
+    loss.backward()
+
+    assert torch.allclose(loss, torch.tensor(0.0))
+    assert teacher_log_probs.grad[0, 0] > 0.0
+    assert teacher_log_probs.grad[0, 1] < 0.0
+    assert metrics["et/objective_reverse_policy_gradient"] == 1.0
+
+
+def test_evolving_teacher_policy_loss_can_reverse_view_contrast():
+    teacher_log_probs = torch.zeros(1, 2, requires_grad=True)
+    student_log_probs = torch.tensor([[4.0, -4.0]], requires_grad=True)
+    advantages = torch.tensor([[2.0, -3.0]])
+    response_mask = torch.ones_like(advantages)
+    cfg = AttrDict(enable=True, loss_weight=0.1, objective="reverse_view_contrast", mask="all")
+
+    loss, metrics = compute_evolving_teacher_policy_loss(
+        teacher_log_probs=teacher_log_probs,
+        student_log_probs=student_log_probs,
+        advantages=advantages,
+        response_mask=response_mask,
+        evolving_teacher_config=cfg,
+    )
+    loss.backward()
+
+    assert torch.allclose(loss, torch.tensor(-10.0))
+    assert teacher_log_probs.grad[0, 0] > 0.0
+    assert teacher_log_probs.grad[0, 1] < 0.0
+    assert student_log_probs.grad is None
+    assert metrics["et/objective_reverse_view_contrast"] == 1.0
+    assert metrics["et/view_delta_mean"] == pytest.approx(0.0)
 
 
 def test_evolving_teacher_config_requires_no_ema_update():

@@ -726,7 +726,7 @@ class DataParallelPPOActor(BasePPOActor):
                 "teacher_position_ids",
                 "self_distillation_mask",
             }
-            if loss_mode == "srpo":
+            if loss_mode in {"srpo", "rlrt"}:
                 self_distillation_required_keys.add("self_distillation_correct_mask")
             assert self_distillation_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {self_distillation_required_keys - set(data.batch.keys())}"
 
@@ -949,6 +949,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 advantages=advantages,
                                 response_mask=response_mask,
                                 evolving_teacher_config=evolving_teacher_cfg,
+                                student_log_probs=log_prob,
                                 self_distillation_mask=self_distillation_mask,
                                 self_distillation_correct_mask=self_distillation_correct_mask,
                                 loss_agg_mode=loss_agg_mode,

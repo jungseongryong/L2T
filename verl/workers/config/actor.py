@@ -38,24 +38,38 @@ __all__ = [
 
 @dataclass
 class EvolvingTeacherConfig(BaseConfig):
-    """Configuration for the ET v0 teacher-view policy-gradient auxiliary loss.
+    """Configuration for the ET v0 teacher-view auxiliary loss.
 
     ET v0 is an actor-only auxiliary loss: no EMA/ref teacher module is
     trained by ET. The actor is additionally updated on teacher-view
-    log-probabilities with GRPO advantages and an implicit importance ratio of
-    1. When self-distillation uses a trust-region teacher, that separate
-    teacher is used only for the distillation target.
+    log-probabilities, optionally relative to the student-view log-probability
+    or in a reverse direction. When self-distillation uses a trust-region
+    teacher, that separate teacher is used only for the distillation target.
     """
 
     enable: bool = False
     loss_weight: float = 0.0
+    objective: str = "policy_gradient"
     mask: str = "all"
+    advantage_filter: str = "all"
 
     def __post_init__(self):
+        valid_objectives = ["policy_gradient", "view_contrast", "reverse_policy_gradient", "reverse_view_contrast"]
         valid_masks = ["all", "context", "correct", "incorrect", "incorrect_context"]
+        valid_advantage_filters = ["all", "positive", "negative"]
+        if self.objective not in valid_objectives:
+            raise ValueError(
+                "self_distillation.evolving_teacher.objective must be one of "
+                f"{valid_objectives}, got {self.objective}"
+            )
         if self.mask not in valid_masks:
             raise ValueError(
                 f"self_distillation.evolving_teacher.mask must be one of {valid_masks}, got {self.mask}"
+            )
+        if self.advantage_filter not in valid_advantage_filters:
+            raise ValueError(
+                "self_distillation.evolving_teacher.advantage_filter must be one of "
+                f"{valid_advantage_filters}, got {self.advantage_filter}"
             )
         if self.loss_weight < 0:
             raise ValueError(
@@ -73,7 +87,7 @@ class SelfDistillationConfig(BaseConfig):
     """Configuration for self-distillation loss.
 
     Args:
-        Distillation context is enabled when policy_loss.loss_mode is "sdpo", "rlsd", or "srpo".
+        Distillation context is enabled when policy_loss.loss_mode is "sdpo", "rlsd", "rlrt", or "srpo".
         full_logit_distillation (bool): Whether to use full-logit KL distillation.
         alpha (float): KL interpolation coefficient. 0.0=forward KL, 1.0=reverse KL, in-between=JSD.
         success_reward_threshold (float): Minimum sequence reward to be considered successful.
@@ -230,7 +244,7 @@ class PolicyLossConfig(BaseConfig):
 
     Args:
         loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg',
-            'sdpo', 'rlsd', 'srpo'.
+            'sdpo', 'rlsd', 'rlrt', 'srpo'.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.

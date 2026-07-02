@@ -11,7 +11,7 @@
 #   chemistry physics biology material tooluse
 #
 # Methods:
-#   grpo rlsd sdpo sdpo_et sdpo_tr sdpo_tr_et srpo
+#   grpo rlsd rlrt rlrt_tr sdpo sdpo_et sdpo_tr sdpo_tr_et srpo srpo_tr
 
 set -euo pipefail
 
@@ -32,7 +32,7 @@ if [[ "${3:-}" == "--dry-run" ]]; then
 fi
 
 if [[ -z "$DATASET" || -z "$METHOD" ]]; then
-    echo "Usage: $0 <chemistry|physics|biology|material|tooluse> <grpo|rlsd|sdpo|sdpo_et|sdpo_tr|sdpo_tr_et|srpo> [--dry-run]" >&2
+    echo "Usage: $0 <chemistry|physics|biology|material|tooluse> <grpo|rlsd|rlrt|rlrt_tr|sdpo|sdpo_et|sdpo_tr|sdpo_tr_et|srpo|srpo_tr> [--dry-run]" >&2
     exit 1
 fi
 
@@ -91,14 +91,18 @@ TRAIN_MAX_SAMPLES="${TRAIN_MAX_SAMPLES:-$((TOTAL_TRAINING_STEPS * TRAIN_BATCH_SI
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-8192}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
+VLLM_GPU_MEMORY_UTILIZATION_WAS_SET="${VLLM_GPU_MEMORY_UTILIZATION+x}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.75}"
 
 SAVE_FREQ="${SAVE_FREQ:-10}"
 TEST_FREQ="${TEST_FREQ:-10}"
+MAX_ACTOR_CKPT_TO_KEEP="${MAX_ACTOR_CKPT_TO_KEEP:-null}"
+MAX_CRITIC_CKPT_TO_KEEP="${MAX_CRITIC_CKPT_TO_KEEP:-null}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
 VAL_ROLLOUT_N="${VAL_ROLLOUT_N:-16}"
 VAL_TEMPERATURE="${VAL_TEMPERATURE:-0.6}"
 VAL_TOP_P="${VAL_TOP_P:-0.95}"
+NORM_ADV_BY_STD_IN_GRPO="${NORM_ADV_BY_STD_IN_GRPO:-False}"
 
 TOKEN_REWEIGHT_LAMBDA="${TOKEN_REWEIGHT_LAMBDA:-0.5}"
 TOKEN_REWEIGHT_DECAY_STEPS="${TOKEN_REWEIGHT_DECAY_STEPS:-0}"
@@ -108,7 +112,9 @@ RLSD_TOKEN_REWEIGHT_EPS_W="${RLSD_TOKEN_REWEIGHT_EPS_W:-0.2}"
 SRPO_DYNAMIC_WEIGHTING="${SRPO_DYNAMIC_WEIGHTING:-true}"
 SRPO_DYNAMIC_WEIGHTING_TEMPERATURE="${SRPO_DYNAMIC_WEIGHTING_TEMPERATURE:-1.0}"
 ET_LOSS_WEIGHT="${ET_LOSS_WEIGHT:-0.1}"
+ET_OBJECTIVE="${ET_OBJECTIVE:-policy_gradient}"
 ET_MASK="${ET_MASK:-context}"
+ET_ADVANTAGE_FILTER="${ET_ADVANTAGE_FILTER:-all}"
 
 METHOD_CANONICAL="$METHOD"
 CONFIG_NAME=""
@@ -149,6 +155,51 @@ case "$METHOD" in
             "actor_rollout_ref.actor.self_distillation.max_reprompt_len=$MAX_MODEL_LEN"
         )
         ;;
+    rlrt)
+        METHOD_CANONICAL="rlrt"
+        CONFIG_NAME="rlrt"
+        GROUP_NAME="QWEN3-RLRT-GRPO-matched-generalization"
+        TRAIN_BATCH_SIZE="${RLRT_TRAIN_BATCH_SIZE:-${RLSD_TRAIN_BATCH_SIZE:-256}}"
+        TRAIN_MAX_SAMPLES="${RLRT_TRAIN_MAX_SAMPLES:-$((TOTAL_TRAINING_STEPS * TRAIN_BATCH_SIZE))}"
+        export WANDB_PROJECT="${RLRT_WANDB_PROJECT:-${RLSD_WANDB_PROJECT:-qwen3-generalization-batch256}}"
+        MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-8}"
+        LR="${LR:-1e-6}"
+        DECAY_SUFFIX="-decay${TOKEN_REWEIGHT_DECAY_STEPS}-ema${TEACHER_UPDATE_RATE}"
+        METHOD_ARGS=(
+            "actor_rollout_ref.actor.policy_loss.loss_mode=rlrt"
+            "actor_rollout_ref.actor.self_distillation.token_reweight_lambda=$TOKEN_REWEIGHT_LAMBDA"
+            "actor_rollout_ref.actor.self_distillation.token_reweight_eps_w=$RLSD_TOKEN_REWEIGHT_EPS_W"
+            "actor_rollout_ref.actor.self_distillation.token_reweight_decay_steps=$TOKEN_REWEIGHT_DECAY_STEPS"
+            "actor_rollout_ref.actor.self_distillation.teacher_update_rate=$TEACHER_UPDATE_RATE"
+            "actor_rollout_ref.actor.self_distillation.max_reprompt_len=$MAX_MODEL_LEN"
+        )
+        ;;
+    rlrt_tr|rlrt-tr|rlrt+tr)
+        METHOD_CANONICAL="rlrt_tr"
+        CONFIG_NAME="rlrt"
+        GROUP_NAME="QWEN3-RLRT-TR-GRPO-matched-generalization"
+        TRAIN_BATCH_SIZE="${RLRT_TR_TRAIN_BATCH_SIZE:-${RLRT_TRAIN_BATCH_SIZE:-64}}"
+        TRAIN_MAX_SAMPLES="${RLRT_TR_TRAIN_MAX_SAMPLES:-$((TOTAL_TRAINING_STEPS * TRAIN_BATCH_SIZE))}"
+        export WANDB_PROJECT="${RLRT_TR_WANDB_PROJECT:-${RLRT_WANDB_PROJECT:-${RLSD_WANDB_PROJECT:-qwen3-generalization-batch256}}}"
+        if [[ -z "$VLLM_GPU_MEMORY_UTILIZATION_WAS_SET" ]]; then
+            VLLM_GPU_MEMORY_UTILIZATION="${RLRT_TR_VLLM_GPU_MEMORY_UTILIZATION:-0.8}"
+        else
+            VLLM_GPU_MEMORY_UTILIZATION="${RLRT_TR_VLLM_GPU_MEMORY_UTILIZATION:-$VLLM_GPU_MEMORY_UTILIZATION}"
+        fi
+        MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-8}"
+        LR="${LR:-1e-6}"
+        DECAY_SUFFIX="-tr${TRUST_REGION_MIX_COEF}-decay${TOKEN_REWEIGHT_DECAY_STEPS}"
+        METHOD_ARGS=(
+            "actor_rollout_ref.model.use_fused_kernels=False"
+            "actor_rollout_ref.actor.policy_loss.loss_mode=rlrt"
+            "actor_rollout_ref.actor.self_distillation.token_reweight_lambda=$TOKEN_REWEIGHT_LAMBDA"
+            "actor_rollout_ref.actor.self_distillation.token_reweight_eps_w=$RLSD_TOKEN_REWEIGHT_EPS_W"
+            "actor_rollout_ref.actor.self_distillation.token_reweight_decay_steps=$TOKEN_REWEIGHT_DECAY_STEPS"
+            "actor_rollout_ref.actor.self_distillation.teacher_regularization=trust-region"
+            "actor_rollout_ref.actor.self_distillation.teacher_update_rate=$TRUST_REGION_MIX_COEF"
+            "actor_rollout_ref.actor.self_distillation.max_reprompt_len=$MAX_MODEL_LEN"
+        )
+        ;;
     sdpo)
         METHOD_CANONICAL="sdpo"
         CONFIG_NAME="sdpo"
@@ -177,7 +228,7 @@ case "$METHOD" in
         TRAIN_MAX_SAMPLES="${SDPO_TR_TRAIN_MAX_SAMPLES:-$((TOTAL_TRAINING_STEPS * TRAIN_BATCH_SIZE))}"
         export WANDB_PROJECT="${SDPO_TR_WANDB_PROJECT:-${SDPO_WANDB_PROJECT:-qwen3-generalization-batch256}}"
         MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-32}"
-        LR="${LR:-5e-6}"
+        LR="${LR:-1e-5}"
         DECAY_SUFFIX="-tr${TRUST_REGION_MIX_COEF}"
         METHOD_ARGS=(
             "actor_rollout_ref.model.use_fused_kernels=False"
@@ -201,7 +252,7 @@ case "$METHOD" in
         MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-32}"
         LR="${LR:-1e-5}"
         TEACHER_UPDATE_RATE="0.0"
-        DECAY_SUFFIX="-noema-et${ET_LOSS_WEIGHT}-mask${ET_MASK}"
+        DECAY_SUFFIX="-noema-et${ET_LOSS_WEIGHT}-${ET_OBJECTIVE}-mask${ET_MASK}-adv${ET_ADVANTAGE_FILTER}"
         METHOD_ARGS=(
             "actor_rollout_ref.actor.policy_loss.loss_mode=sdpo"
             "actor_rollout_ref.actor.self_distillation.distillation_topk=100"
@@ -212,7 +263,9 @@ case "$METHOD" in
             "actor_rollout_ref.actor.self_distillation.max_reprompt_len=$MAX_MODEL_LEN"
             "actor_rollout_ref.actor.self_distillation.evolving_teacher.enable=True"
             "actor_rollout_ref.actor.self_distillation.evolving_teacher.loss_weight=$ET_LOSS_WEIGHT"
+            "actor_rollout_ref.actor.self_distillation.evolving_teacher.objective=$ET_OBJECTIVE"
             "actor_rollout_ref.actor.self_distillation.evolving_teacher.mask=$ET_MASK"
+            "actor_rollout_ref.actor.self_distillation.evolving_teacher.advantage_filter=$ET_ADVANTAGE_FILTER"
         )
         ;;
     sdpo_tr_et|sdpo-tr-et|sdpo+tr+et|sdpo+et+tr)
@@ -224,7 +277,7 @@ case "$METHOD" in
         export WANDB_PROJECT="${SDPO_TR_ET_WANDB_PROJECT:-${SDPO_TR_WANDB_PROJECT:-${SDPO_WANDB_PROJECT:-qwen3-generalization-batch256}}}"
         MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-32}"
         LR="${LR:-5e-6}"
-        DECAY_SUFFIX="-tr${TRUST_REGION_MIX_COEF}-et${ET_LOSS_WEIGHT}-mask${ET_MASK}"
+        DECAY_SUFFIX="-tr${TRUST_REGION_MIX_COEF}-et${ET_LOSS_WEIGHT}-${ET_OBJECTIVE}-mask${ET_MASK}-adv${ET_ADVANTAGE_FILTER}"
         METHOD_ARGS=(
             "actor_rollout_ref.model.use_fused_kernels=False"
             "actor_rollout_ref.actor.policy_loss.loss_mode=sdpo"
@@ -237,7 +290,9 @@ case "$METHOD" in
             "actor_rollout_ref.actor.self_distillation.max_reprompt_len=$MAX_MODEL_LEN"
             "actor_rollout_ref.actor.self_distillation.evolving_teacher.enable=True"
             "actor_rollout_ref.actor.self_distillation.evolving_teacher.loss_weight=$ET_LOSS_WEIGHT"
+            "actor_rollout_ref.actor.self_distillation.evolving_teacher.objective=$ET_OBJECTIVE"
             "actor_rollout_ref.actor.self_distillation.evolving_teacher.mask=$ET_MASK"
+            "actor_rollout_ref.actor.self_distillation.evolving_teacher.advantage_filter=$ET_ADVANTAGE_FILTER"
         )
         ;;
     srpo)
@@ -262,6 +317,30 @@ case "$METHOD" in
             "actor_rollout_ref.actor.self_distillation.srpo_dynamic_weighting_temperature=$SRPO_DYNAMIC_WEIGHTING_TEMPERATURE"
         )
         ;;
+    srpo_tr|srpo-tr|srpo+tr)
+        METHOD_CANONICAL="srpo_tr"
+        CONFIG_NAME="sdpo"
+        GROUP_NAME="QWEN3-SRPO-TR-GRPO-matched-generalization"
+        TRAIN_BATCH_SIZE="${SRPO_TR_TRAIN_BATCH_SIZE:-${SRPO_TRAIN_BATCH_SIZE:-256}}"
+        TRAIN_MAX_SAMPLES="${SRPO_TR_TRAIN_MAX_SAMPLES:-$((TOTAL_TRAINING_STEPS * TRAIN_BATCH_SIZE))}"
+        export WANDB_PROJECT="${SRPO_TR_WANDB_PROJECT:-${SRPO_WANDB_PROJECT:-qwen3-generalization-batch256}}"
+        MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-32}"
+        LR="${LR:-5e-6}"
+        DECAY_SUFFIX="-tr${TRUST_REGION_MIX_COEF}-dw${SRPO_DYNAMIC_WEIGHTING}"
+        METHOD_ARGS=(
+            "actor_rollout_ref.model.use_fused_kernels=False"
+            "actor_rollout_ref.actor.policy_loss.loss_mode=srpo"
+            "actor_rollout_ref.actor.self_distillation.distillation_topk=100"
+            "actor_rollout_ref.actor.self_distillation.alpha=0.5"
+            "actor_rollout_ref.actor.self_distillation.teacher_regularization=trust-region"
+            "actor_rollout_ref.actor.self_distillation.teacher_update_rate=$TRUST_REGION_MIX_COEF"
+            "actor_rollout_ref.actor.self_distillation.is_clip=2.0"
+            "actor_rollout_ref.actor.self_distillation.include_environment_feedback=False"
+            "actor_rollout_ref.actor.self_distillation.max_reprompt_len=$MAX_MODEL_LEN"
+            "actor_rollout_ref.actor.self_distillation.srpo_dynamic_weighting=$SRPO_DYNAMIC_WEIGHTING"
+            "actor_rollout_ref.actor.self_distillation.srpo_dynamic_weighting_temperature=$SRPO_DYNAMIC_WEIGHTING_TEMPERATURE"
+        )
+        ;;
     *)
         echo "Unknown method: $METHOD" >&2
         exit 1
@@ -269,7 +348,7 @@ case "$METHOD" in
 esac
 
 METHOD_UPPER="$(echo "$METHOD_CANONICAL" | tr '[:lower:]' '[:upper:]')"
-EXP_NAME="qwen3gen-${DATASET}-${METHOD_UPPER}-${MODEL_NAME_FOR_EXP}-mbs${MINI_BATCH_SIZE}${DECAY_SUFFIX}-train${TRAIN_BATCH_SIZE}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-vllm${VLLM_GPU_MEMORY_UTILIZATION}"
+EXP_NAME="qwen3gen-${DATASET}-${METHOD_UPPER}-${MODEL_NAME_FOR_EXP}-mbs${MINI_BATCH_SIZE}${DECAY_SUFFIX}-train${TRAIN_BATCH_SIZE}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-vllm${VLLM_GPU_MEMORY_UTILIZATION}${EXPERIMENT_SUFFIX:-}"
 
 export EXPERIMENT="$EXP_NAME"
 export RAY_PORT="${RAY_PORT:-6379}"
@@ -309,6 +388,8 @@ ARGS=(
     "trainer.val_before_train=$VAL_BEFORE_TRAIN"
     "trainer.save_freq=$SAVE_FREQ"
     "trainer.test_freq=$TEST_FREQ"
+    "trainer.max_actor_ckpt_to_keep=$MAX_ACTOR_CKPT_TO_KEEP"
+    "trainer.max_critic_ckpt_to_keep=$MAX_CRITIC_CKPT_TO_KEEP"
     "trainer.default_local_dir=$CKPT_DIR/$DATA_PATH/$EXP_NAME"
     "custom_reward_function.path=$WORKSPACE_DIR/verl/utils/reward_score/feedback/__init__.py"
     "+ray_kwargs.ray_init._temp_dir=$RAY_TMPDIR"
@@ -333,7 +414,7 @@ ARGS=(
     "actor_rollout_ref.rollout.val_kwargs.temperature=$VAL_TEMPERATURE"
     "actor_rollout_ref.rollout.val_kwargs.top_p=$VAL_TOP_P"
     "actor_rollout_ref.rollout.val_kwargs.do_sample=True"
-    "algorithm.norm_adv_by_std_in_grpo=False"
+    "algorithm.norm_adv_by_std_in_grpo=$NORM_ADV_BY_STD_IN_GRPO"
     "algorithm.rollout_correction.rollout_is=token"
     "algorithm.rollout_correction.rollout_is_threshold=2.0"
 )

@@ -24,7 +24,7 @@ echo "Config: $CONFIG_NAME"
 echo "Task: $TASK"
 echo "Arguments: $@"
 
-python -m verl.trainer.main_ppo --config-name $CONFIG_NAME "$@"
+"${PYTHON_BIN:-python}" -m verl.trainer.main_ppo --config-name $CONFIG_NAME "$@"
 status=$?
 echo "main_ppo exit code: $status"
 exit $status

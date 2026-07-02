@@ -3,7 +3,7 @@
 # Queue Qwen3 generalization runs after a PID exits.
 #
 # Usage:
-#   bash scripts/queue_qwen3_generalization_after_pid.sh <pid-to-wait-for> [grpo rlsd sdpo srpo]
+#   bash scripts/queue_qwen3_generalization_after_pid.sh <pid-to-wait-for> [grpo rlsd rlrt rlrt_tr sdpo sdpo_tr srpo srpo_tr]
 #
 # Environment:
 #   MODEL_PATH=Qwen/Qwen3-4B or Qwen/Qwen3-8B
@@ -12,12 +12,12 @@
 
 set -euo pipefail
 
-WAIT_PID="${1:?usage: $0 <pid-to-wait-for> [grpo rlsd sdpo srpo]}"
+WAIT_PID="${1:?usage: $0 <pid-to-wait-for> [grpo rlsd rlrt rlrt_tr sdpo sdpo_tr srpo srpo_tr]}"
 shift || true
 
 METHODS=("$@")
 if [ "${#METHODS[@]}" -eq 0 ]; then
-    METHODS=(grpo rlsd sdpo srpo)
+    METHODS=(grpo rlsd rlrt sdpo srpo)
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

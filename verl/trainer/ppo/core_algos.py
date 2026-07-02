@@ -57,7 +57,9 @@ POLICY_LOSS_REGISTRY: dict[str, PolicyLossFn] = {}
 
 SDPO_LOSS_MODE = "sdpo"
 SRPO_LOSS_MODE = "srpo"
-SELF_DISTILLATION_REWEIGHT_LOSS_MODES = {"rlsd"}
+RLSD_LOSS_MODE = "rlsd"
+RLRT_LOSS_MODE = "rlrt"
+SELF_DISTILLATION_REWEIGHT_LOSS_MODES = {RLSD_LOSS_MODE, RLRT_LOSS_MODE}
 SELF_DISTILLATION_LOSS_MODES = {SDPO_LOSS_MODE, SRPO_LOSS_MODE, *SELF_DISTILLATION_REWEIGHT_LOSS_MODES}
 
 
@@ -1141,16 +1143,25 @@ def compute_self_distillation_reweighted_advantages(
     self_distillation_correct_mask: Optional[torch.Tensor] = None,
     global_step: Optional[int] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Apply RLSD token reweighting to GRPO advantages.
+    """Apply self-distillation token reweighting to GRPO advantages.
 
-    Uses the same SDPO teacher context supplied by the trainer. Tokens without
-    that context keep their original GRPO advantage.
+    RLSD uses the teacher-over-student ratio as a correction signal. RLRT uses
+    the reversed student-over-teacher ratio and gates the update to correct
+    rollouts only. Tokens outside the active context keep their original GRPO
+    advantage.
     """
     normalized_mode = normalize_self_distillation_loss_mode(loss_mode)
-    if normalized_mode != "rlsd":
+    if normalized_mode not in SELF_DISTILLATION_REWEIGHT_LOSS_MODES:
         raise ValueError(f"Unsupported self-distillation token reweight mode: {loss_mode}")
 
+    if normalized_mode == RLRT_LOSS_MODE and self_distillation_correct_mask is None:
+        raise ValueError("RLRT requires self_distillation_correct_mask for reward-gated reweighting.")
+
+    # RLSD: Delta = log P_T(y_t) - log P_S(y_t).
+    # RLRT: D_hat = log P_S(y_t) - log P_T(y_t), the reversed teacher signal.
     log_ratio = teacher_log_probs - student_log_probs
+    if normalized_mode == RLRT_LOSS_MODE:
+        log_ratio = -log_ratio
     sign_advantage = torch.sign(advantages).detach()
     log_weight = torch.clamp(sign_advantage * log_ratio.detach(), min=-20.0, max=20.0)
     raw_weight = torch.exp(log_weight)
@@ -1172,6 +1183,8 @@ def compute_self_distillation_reweighted_advantages(
     active_mask = response_mask.to(dtype=modulator.dtype)
     if self_distillation_mask is not None:
         active_mask = active_mask * self_distillation_mask.to(dtype=modulator.dtype).unsqueeze(-1)
+    if normalized_mode == RLRT_LOSS_MODE:
+        active_mask = active_mask * self_distillation_correct_mask.to(dtype=modulator.dtype).unsqueeze(-1)
 
     modulator = active_mask * modulator + (1.0 - active_mask)
     refined_advantages = advantages * modulator
@@ -1179,6 +1192,7 @@ def compute_self_distillation_reweighted_advantages(
     valid = response_mask.bool()
     active = active_mask.bool() & valid
     metrics: dict[str, Any] = {
+        "self_distillation/token_reweight_is_rlrt": float(normalized_mode == RLRT_LOSS_MODE),
         "self_distillation/token_reweight_lambda": lambda_t,
         "self_distillation/token_reweight_eps_w": eps_w,
         "self_distillation/token_reweight_active_token_fraction": (
@@ -1195,6 +1209,10 @@ def compute_self_distillation_reweighted_advantages(
         metrics["self_distillation/token_reweight_correct_sample_fraction"] = (
             self_distillation_correct_mask.float().mean().detach().item()
         )
+        if normalized_mode == RLRT_LOSS_MODE:
+            metrics["self_distillation/token_reweight_reward_gate_fraction"] = (
+                self_distillation_correct_mask.float().mean().detach().item()
+            )
     if active.any():
         active_weight = raw_weight[active]
         active_clipped_weight = clipped_weight[active]
@@ -1514,17 +1532,23 @@ def compute_evolving_teacher_policy_loss(
     advantages: torch.Tensor,
     response_mask: torch.Tensor,
     evolving_teacher_config: Any,
+    student_log_probs: Optional[torch.Tensor] = None,
     self_distillation_mask: Optional[torch.Tensor] = None,
     self_distillation_correct_mask: Optional[torch.Tensor] = None,
     loss_agg_mode: str = "token-mean",
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """ET v0 teacher-view policy-gradient loss.
+    """ET v0 teacher-view auxiliary loss.
 
-    The trajectories are sampled from the student view, so ET v0 uses an implicit
-    importance ratio of 1 and applies GRPO advantages directly to teacher-view
-    log-probabilities.
+    ``policy_gradient`` uses an implicit importance ratio of 1 and applies GRPO
+    advantages directly to teacher-view log-probabilities. ``view_contrast``
+    applies the same advantages to the teacher-vs-student view log-probability
+    gap, detaching the student view. ``reverse_policy_gradient`` pushes the
+    teacher-view log-probability in the opposite direction. ``reverse_view_contrast``
+    reverses the teacher-vs-student view contrast while keeping the student
+    view detached.
     """
 
+    objective = _config_get(evolving_teacher_config, "objective", "policy_gradient")
     mask_mode = _config_get(evolving_teacher_config, "mask", "all")
     et_mask = _build_evolving_teacher_mask(
         response_mask=response_mask,
@@ -1532,8 +1556,33 @@ def compute_evolving_teacher_policy_loss(
         self_distillation_mask=self_distillation_mask,
         self_distillation_correct_mask=self_distillation_correct_mask,
     )
+    advantage_filter = _config_get(evolving_teacher_config, "advantage_filter", "all")
     detached_advantages = advantages.detach()
-    loss_mat = -detached_advantages * teacher_log_probs
+    if advantage_filter == "positive":
+        et_mask = et_mask * (detached_advantages > 0).to(dtype=et_mask.dtype, device=et_mask.device)
+    elif advantage_filter == "negative":
+        et_mask = et_mask * (detached_advantages < 0).to(dtype=et_mask.dtype, device=et_mask.device)
+    elif advantage_filter != "all":
+        raise ValueError(f"Unsupported ET advantage_filter: {advantage_filter}")
+
+    view_delta = None
+    if objective == "policy_gradient":
+        loss_mat = -detached_advantages * teacher_log_probs
+    elif objective == "reverse_policy_gradient":
+        loss_mat = detached_advantages * teacher_log_probs
+    elif objective == "view_contrast":
+        if student_log_probs is None:
+            raise ValueError("ET objective 'view_contrast' requires student_log_probs.")
+        view_delta = teacher_log_probs - student_log_probs.detach()
+        loss_mat = -detached_advantages * view_delta
+    elif objective == "reverse_view_contrast":
+        if student_log_probs is None:
+            raise ValueError("ET objective 'reverse_view_contrast' requires student_log_probs.")
+        view_delta = teacher_log_probs - student_log_probs.detach()
+        loss_mat = detached_advantages * view_delta
+    else:
+        raise ValueError(f"Unsupported ET objective: {objective}")
+
     loss = agg_loss(
         loss_mat=loss_mat,
         loss_mask=et_mask,
@@ -1552,13 +1601,22 @@ def compute_evolving_teacher_policy_loss(
         "et/active_sample_fraction": (
             sample_active.sum() / sample_valid.sum().clamp(min=1.0)
         ).detach().item(),
+        "et/objective_view_contrast": float(objective == "view_contrast"),
+        "et/objective_reverse_policy_gradient": float(objective == "reverse_policy_gradient"),
+        "et/objective_reverse_view_contrast": float(objective == "reverse_view_contrast"),
+        "et/advantage_filter_positive": float(advantage_filter == "positive"),
+        "et/advantage_filter_negative": float(advantage_filter == "negative"),
     }
     if active_bool.any().item():
         metrics["et/advantage_mean"] = detached_advantages[active_bool].mean().detach().item()
         metrics["et/log_prob_mean"] = teacher_log_probs.detach()[active_bool].mean().item()
+        if view_delta is not None:
+            metrics["et/view_delta_mean"] = view_delta.detach()[active_bool].mean().item()
     else:
         metrics["et/advantage_mean"] = 0.0
         metrics["et/log_prob_mean"] = 0.0
+        if view_delta is not None:
+            metrics["et/view_delta_mean"] = 0.0
     return loss, metrics
 
 
